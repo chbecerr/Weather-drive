@@ -52,7 +52,7 @@ async function geocode(query) {
 async function getRoute(a, b) {
   const url =
     `https://router.project-osrm.org/route/v1/driving/${a.lon},${a.lat};${b.lon},${b.lat}` +
-    `?overview=full&geometries=geojson`;
+    `?overview=full&geometries=geojson&steps=true`;
   const data = await fetchJson(url, "routing");
   if (data.code !== "Ok" || !data.routes?.length) {
     throw new Error("Couldn't find a driving route between those places.");
@@ -62,7 +62,36 @@ async function getRoute(a, b) {
     coords: r.geometry.coordinates.map(([lon, lat]) => ({ lat, lon })),
     meters: r.distance,
     seconds: r.duration,
+    steps: (r.legs || []).flatMap((l) => l.steps || []).map((st) => ({
+      meters: st.distance,
+      road: roadName(st),
+    })),
   };
+}
+
+// Human-friendly road label from an OSRM step, e.g. "Golden State Freeway (I 5)".
+function roadName(step) {
+  const name = (step.name || "").trim();
+  const ref = (step.ref || "").trim();
+  if (name && ref && name !== ref) return `${name} (${ref})`;
+  return name || ref || null;
+}
+
+// The road being driven at a given distance along the route.
+// If that stretch is unnamed (ramps, connectors), borrow the nearest named one.
+function roadAt(steps, meters) {
+  if (!steps.length) return null;
+  let acc = 0, idx = steps.length - 1;
+  for (let i = 0; i < steps.length; i++) {
+    acc += steps[i].meters;
+    if (meters <= acc) { idx = i; break; }
+  }
+  for (let d = 0; d < steps.length; d++) {
+    for (const j of [idx - d, idx + d]) {
+      if (steps[j] && steps[j].road) return steps[j].road;
+    }
+  }
+  return null;
 }
 
 /* ---------- Geometry: sample points along the route ---------- */
@@ -192,7 +221,8 @@ function labelFor(s, u) {
   const dist = fmt.dist(s.meters, u);
   if (s.idx === 0) return s.place ? `Start: ${s.place}` : "Start";
   if (s.idx === s.last) return s.place ? `Destination: ${s.place}` : "Destination";
-  return s.place ? `${s.place} (${dist} in)` : `${dist} in`;
+  const where = s.road && s.place ? `${s.road} near ${s.place}` : s.road || s.place;
+  return where ? `${where} (${dist} in)` : `${dist} in`;
 }
 
 function popupHtml(s, trip, u) {
@@ -424,7 +454,7 @@ async function run(ev) {
     const stops = points.map((p, i) => {
       const eta = depart + p.frac * route.seconds * 1000;
       const w = locs[i] ? readHour(locs[i], eta) : null;
-      return { ...p, eta, w, idx: i, last: points.length - 1, alerts: w ? assess(w) : [] };
+      return { ...p, eta, w, idx: i, last: points.length - 1, road: roadAt(route.steps, p.meters), alerts: w ? assess(w) : [] };
     });
 
     lastTrip = { stops, route, depart, originName: origin.name, destName: dest.name };
