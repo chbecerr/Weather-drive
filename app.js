@@ -177,21 +177,34 @@ const fmt = {
 };
 
 /* ---------- Rendering ---------- */
-let map, layer, lastTrip = null;
+let map, layer, markers = [], lastTrip = null;
 
-function render(trip) {
-  const u = $("units").value;
-  const { route, depart } = trip;
-  const stops = trip.stops.map((s) => ({
-    ...s,
-    label: s.idx === 0 ? "Start" : s.idx === s.last ? "Destination" : `${fmt.dist(s.meters, u)} in`,
-  }));
-  $("results").hidden = false;
+// Time shown on a stop: just the clock time on the departure day, otherwise include the date.
+function whenLabel(ms, departMs) {
+  const d = new Date(ms), dep = new Date(departMs);
+  const sameDay = d.toDateString() === dep.toDateString();
+  return d.toLocaleString([], sameDay
+    ? { hour: "numeric", minute: "2-digit" }
+    : { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
 
+function labelFor(s, u) {
+  const dist = fmt.dist(s.meters, u);
+  if (s.idx === 0) return s.place ? `Start: ${s.place}` : "Start";
+  if (s.idx === s.last) return s.place ? `Destination: ${s.place}` : "Destination";
+  return s.place ? `${s.place} (${dist} in)` : `${dist} in`;
+}
+
+function popupHtml(s, trip, u) {
+  const [desc, emoji] = s.w ? describe(s.w.code) : ["No forecast", "❔"];
+  const detail = s.w ? `${emoji} ${desc}, ${fmt.temp(s.w.temp, u)}` : "No forecast available";
+  return `<strong>${escapeHtml(labelFor(s, u))}</strong><br>${escapeHtml(whenLabel(s.eta, trip.depart))}<br>${escapeHtml(detail)}`;
+}
+
+function renderSummary(trip, u) {
+  const { route, depart, stops } = trip;
   const worst = levelOf(stops.flatMap((s) => s.alerts));
   const flagged = stops.filter((s) => s.alerts.length);
-
-  // Summary
   const summary = $("summary");
   summary.className = worst === "ok" ? "" : worst;
   const headline = {
@@ -201,16 +214,17 @@ function render(trip) {
   }[worst];
   const known = stops.filter((s) => s.w);
   const temps = known.map((s) => s.w.temp);
+  const fullDate = new Date(depart).toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
   let html = `<h2>${headline}</h2>
     <p class="meta">${escapeHtml(fmt.dist(route.meters, u))} · ${escapeHtml(fmt.duration(route.seconds))} drive ·
-    leaving ${escapeHtml(fmt.time(depart))}</p>`;
+    leaving ${escapeHtml(fullDate)}</p>`;
   if (known.length) {
     html += `<p>Temperatures from ${escapeHtml(fmt.temp(Math.min(...temps), u))} to
       ${escapeHtml(fmt.temp(Math.max(...temps), u))}.</p>`;
   }
   if (flagged.length) {
     html += "<ul>" + flagged.map((s) =>
-      `<li><strong>${escapeHtml(s.label)}</strong> (${escapeHtml(fmt.time(s.eta))}): ` +
+      `<li><strong>${escapeHtml(labelFor(s, u))}</strong> (${escapeHtml(whenLabel(s.eta, depart))}): ` +
       escapeHtml(s.alerts.map((a) => a.text).join("; ")) + "</li>").join("") + "</ul>";
   } else if (known.length) {
     html += "<p>No notable hazards in the forecast along the way.</p>";
@@ -219,45 +233,16 @@ function render(trip) {
     html += "<p class='note'>Some points on your trip are beyond the available forecast range and are marked as unknown.</p>";
   }
   summary.innerHTML = html;
+}
 
-  // Map (optional: the timeline still works if the map library fails to load)
-  try {
-    if (typeof L === "undefined") throw new Error("no map");
-  if (!map) {
-    map = L.map("map");
-    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 18,
-      attribution: "© OpenStreetMap contributors",
-    }).addTo(map);
-  }
-  if (layer) layer.remove();
-  layer = L.layerGroup().addTo(map);
-  const line = L.polyline(route.coords.map((p) => [p.lat, p.lon]), { color: "#2563eb", weight: 5, opacity: 0.8 }).addTo(layer);
-  stops.forEach((s, i) => {
-    const lvl = s.w ? levelOf(s.alerts) : "ok";
-    const icon = L.divIcon({
-      className: "",
-      html: `<div class="pin ${lvl}">${i + 1}</div>`,
-      iconSize: [22, 22],
-      iconAnchor: [11, 11],
-    });
-    const [desc, emoji] = s.w ? describe(s.w.code) : ["No forecast", "❔"];
-    const detail = s.w ? `${emoji} ${desc}, ${fmt.temp(s.w.temp, u)}` : "No forecast available";
-    L.marker([s.lat, s.lon], { icon }).addTo(layer)
-      .bindPopup(`<strong>${escapeHtml(s.label)}</strong><br>${escapeHtml(fmt.time(s.eta))}<br>${escapeHtml(detail)}`);
-  });
-  map.fitBounds(line.getBounds(), { padding: [24, 24] });
-  setTimeout(() => map.invalidateSize(), 0);
-  } catch (e) {
-    $("map").hidden = true;
-  }
-
-  // Timeline
-  $("timeline").innerHTML = stops.map((s, i) => {
+function renderTimeline(trip, u) {
+  $("timeline").innerHTML = trip.stops.map((s, i) => {
+    const label = `${i + 1}. ${labelFor(s, u)}`;
+    const when = whenLabel(s.eta, trip.depart);
     if (!s.w) {
       return `<li class="stop"><div class="icon">❔</div><div>
-        <h3>${i + 1}. ${escapeHtml(s.label)}</h3>
-        <div class="when">${escapeHtml(fmt.time(s.eta))}</div>
+        <h3>${escapeHtml(label)}</h3>
+        <div class="when">${escapeHtml(when)}</div>
         <div class="desc">No forecast available for this time</div></div></li>`;
     }
     const [desc, emoji] = describe(s.w.code);
@@ -269,13 +254,86 @@ function render(trip) {
       s.w.precip > 0 ? `💧 ${fmt.precip(s.w.precip, u)}` : null,
     ].filter(Boolean);
     return `<li class="stop ${lvl === "ok" ? "" : lvl}"><div class="icon">${emoji}</div><div>
-      <h3>${i + 1}. ${escapeHtml(s.label)}</h3>
-      <div class="when">${escapeHtml(fmt.time(s.eta))}</div>
+      <h3>${escapeHtml(label)}</h3>
+      <div class="when">${escapeHtml(when)}</div>
       <div class="desc">${escapeHtml(desc)}</div>
       <div class="stats">${stats.map((t) => `<span>${escapeHtml(t)}</span>`).join("")}</div>
       ${s.alerts.length ? `<ul class="alerts">${s.alerts.map((a) => `<li class="${a.level}">${a.level === "warn" ? "⚠️" : "⚡"} ${escapeHtml(a.text)}</li>`).join("")}</ul>` : ""}
     </div></li>`;
   }).join("");
+}
+
+function renderMap(trip, u) {
+  // Optional: the timeline still works if the map library fails to load.
+  try {
+    if (typeof L === "undefined") throw new Error("no map");
+    $("map").hidden = false;
+    if (!map) {
+      map = L.map("map");
+      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 18,
+        attribution: "© OpenStreetMap contributors",
+      }).addTo(map);
+    }
+    if (layer) layer.remove();
+    layer = L.layerGroup().addTo(map);
+    const line = L.polyline(trip.route.coords.map((p) => [p.lat, p.lon]), { color: "#2563eb", weight: 5, opacity: 0.8 }).addTo(layer);
+    markers = trip.stops.map((s, i) => {
+      const icon = L.divIcon({
+        className: "",
+        html: `<div class="pin ${s.w ? levelOf(s.alerts) : "ok"}">${i + 1}</div>`,
+        iconSize: [22, 22],
+        iconAnchor: [11, 11],
+      });
+      return L.marker([s.lat, s.lon], { icon }).addTo(layer).bindPopup(popupHtml(s, trip, u));
+    });
+    map.invalidateSize();
+    map.fitBounds(line.getBounds(), { padding: [24, 24] });
+    setTimeout(() => { map.invalidateSize(); map.fitBounds(line.getBounds(), { padding: [24, 24] }); }, 100);
+  } catch (e) {
+    $("map").hidden = true;
+  }
+}
+
+function render(trip) {
+  const u = $("units").value;
+  $("results").hidden = false;
+  renderSummary(trip, u);
+  renderMap(trip, u);
+  renderTimeline(trip, u);
+}
+
+// Called as place names arrive: refresh text only, leave the map view alone.
+function refreshLabels(trip) {
+  const u = $("units").value;
+  renderSummary(trip, u);
+  renderTimeline(trip, u);
+  markers.forEach((m, i) => m.setPopupContent(popupHtml(trip.stops[i], trip, u)));
+}
+
+/* ---------- Place names (Nominatim reverse geocoding) ---------- */
+async function reversePlace(p) {
+  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=10&lat=${p.lat.toFixed(4)}&lon=${p.lon.toFixed(4)}`;
+  const data = await fetchJson(url, "place-name");
+  const a = data.address || {};
+  const name = a.city || a.town || a.village || a.hamlet || a.municipality || a.county;
+  if (!name) return null;
+  return a.state && a.state !== name ? `${name}, ${a.state}` : name;
+}
+
+// Nominatim allows ~1 request/second, so fill names in one at a time.
+async function fillPlaces(trip) {
+  for (const s of trip.stops) {
+    if (lastTrip !== trip) return; // a newer search replaced this one
+    try {
+      const place = await reversePlace(s);
+      if (place && lastTrip === trip) {
+        s.place = place;
+        refreshLabels(trip);
+      }
+    } catch (e) { /* names are a nicety; ignore failures */ }
+    await new Promise((r) => setTimeout(r, 1100));
+  }
 }
 
 /* ---------- Accuracy notice ---------- */
@@ -372,6 +430,7 @@ async function run(ev) {
     lastTrip = { stops, route, depart, originName: origin.name, destName: dest.name };
     render(lastTrip);
     setStatus("");
+    fillPlaces(lastTrip);
     $("results").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (e) {
     setStatus(e.message || "Something went wrong.", true);
@@ -399,7 +458,7 @@ function init() {
   $("origin").addEventListener("input", () => { if ($("origin").value !== "My current location") myLocation = null; });
   $("locate").addEventListener("click", useMyLocation);
   $("depart").addEventListener("input", updateAccuracyNote);
-  $("units").addEventListener("change", () => { if (lastTrip) render(lastTrip); });
+  $("units").addEventListener("change", () => { if (lastTrip) refreshLabels(lastTrip); });
   $("trip-form").addEventListener("submit", run);
   updateAccuracyNote();
 }
